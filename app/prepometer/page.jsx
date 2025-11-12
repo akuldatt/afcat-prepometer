@@ -1,12 +1,12 @@
 'use client';
 
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useEffect, useState, useMemo, useRef } from 'react';
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, Legend, LineChart, Line, CartesianGrid } from 'recharts';
 import * as XLSX from 'xlsx';
 import { saveAs } from 'file-saver';
 import { supabase } from '@/lib/supabaseClient';
 
-// AFCAT Prepometer — original UI preserved, Supabase auth + sync added
+// AFCAT Prepometer — original UI preserved, Supabase auth + sync added + fixes
 
 const DEFAULT_CHECKLIST = [
   { id: 1, subject: 'Maths', topic: 'Ratio & Proportion', status: 'Not started', notes: '' },
@@ -38,7 +38,8 @@ export default function Prepometer() {
   // Auth
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
-  const [emailInput, setEmailInput] = useState('');
+  // note: removed controlled emailInput state to avoid caret jump
+  const emailRef = useRef(null);
 
   // Data states (local copy shown in UI)
   const [checklist, setChecklist] = useState(() => {
@@ -87,13 +88,13 @@ export default function Prepometer() {
     };
   }, []);
 
-  // compute progress
+  // compute progress (case-insensitive check for 'done')
   const progress = useMemo(() => {
     const res = { English:0, Maths:0, Reasoning:0, GK:0 };
     SUBJECTS.forEach(s => {
       const items = checklist.filter(i => i.subject === s);
       if (items.length === 0) { res[s] = 0; return; }
-      const done = items.filter(i => i.status === 'Done').length;
+      const done = items.filter(i => String(i.status || '').toLowerCase().startsWith('done')).length;
       res[s] = Math.round((done/items.length)*100);
     });
     return res;
@@ -254,28 +255,24 @@ export default function Prepometer() {
 
   // ---- UI handlers (local update + remote save when logged in)
   const updateChecklistItem = (id, patch) => {
-    setChecklist(prev => {
-      const updated = prev.map(it => it.id === id ? { ...it, ...patch } : it);
+    setChecklist(c => {
+      const updated = c.map(it => it.id === id ? { ...it, ...patch } : it);
       const changed = updated.find(it => it.id === id);
       // remote save (non-blocking)
       if (user && changed) saveChecklistItemToSupabase(changed).catch(console.error);
       return updated;
     });
   };
-
   const deleteChecklistItem = (id) => {
     if (!confirm('Delete this topic?')) return;
-    setChecklist(prev => prev.filter(it => it.id !== id));
+    setChecklist(c => c.filter(it => it.id !== id));
     if (user && typeof id === 'number') deleteChecklistFromSupabase(id).catch(console.error);
   };
-
   const addNewTopic = () => {
     if (!newTopic.topic.trim()) { alert('Enter topic name'); return; }
-    // temp id so local UI is responsive
     const tempId = 't' + Date.now();
     const newItem = { id: tempId, subject: newTopic.subject, topic: newTopic.topic, status: newTopic.status, notes: newTopic.notes || '' };
-    setChecklist(prev => [...prev, newItem]);
-    // if logged in, insert remotely and update id mapping
+    setChecklist(c => [...c, newItem]);
     (async () => {
       if (user) {
         const { data, error } = await supabase.from('checklists').insert([{
@@ -293,26 +290,23 @@ export default function Prepometer() {
     })();
     setNewTopic({ subject: 'Maths', topic: '', status: 'Not started', notes: '' });
   };
-
   const addDay = async () => {
     const entry = { date: new Date().toLocaleDateString(), hours: Number(today.hours||0), mathsQ: Number(today.mathsQ||0), reasoningQ: Number(today.reasoningQ||0), mock: today.mock === '' ? '' : Number(today.mock), notes: today.notes || '' };
-    setDailyData(prev => [...prev, entry]);
+    setDailyData(d => [...d, entry]);
     if (user) {
       await addDayRemote(entry);
     }
     setToday({ hours:'', mathsQ:'', reasoningQ:'', mock:'' });
   };
-
-  const resetAll = () => { if(!confirm('Reset all?')) return; setChecklist(DEFAULT_CHECKLIST); setDailyData([]); localStorage.removeItem('prep_checklist'); localStorage.removeItem('prep_daily'); if (user) { /* option: clear remote too — skip for safety */ } };
+  const resetAll = () => { if(!confirm('Reset all?')) return; setChecklist(DEFAULT_CHECKLIST); setDailyData([]); localStorage.removeItem('prep_checklist'); localStorage.removeItem('prep_daily'); if (user) { /* skip remote clear */ } };
 
   // ---- Auth helpers
   async function signInWithEmail(email) {
     if (!email) { alert('Enter email'); return; }
     const { error } = await supabase.auth.signInWithOtp({ email });
-    if (error) alert('Sign in error: ' + error.message);
+    if (error) alert('Sign in error: ' + (error.message || error));
     else alert('Magic link sent. Check your email and click the link to sign in.');
   }
-
   async function signOut() {
     await supabase.auth.signOut();
     setUser(null);
@@ -366,7 +360,7 @@ export default function Prepometer() {
     grid:{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(260px,1fr))',gap:12,marginBottom:12}
   };
 
-  // header auth UI component (keeps the look minimal)
+  // header auth UI component (keeps the look minimal) — uses ref to avoid caret jump
   function AuthControls() {
     if (authLoading) return <div style={{color:'#777'}}>Checking auth…</div>;
     if (user) {
@@ -380,8 +374,8 @@ export default function Prepometer() {
     }
     return (
       <div style={{display:'flex',gap:8,alignItems:'center'}}>
-        <input placeholder="Email for magic link" value={emailInput} onChange={e=>setEmailInput(e.target.value)} style={{padding:8,borderRadius:6,border:'1px solid #ddd'}} />
-        <button style={{padding:'8px 12px',borderRadius:8,background:'#2563eb',color:'#fff',border:'none'}} onClick={()=>signInWithEmail(emailInput)}>Send Link</button>
+        <input ref={emailRef} placeholder="Email for magic link" defaultValue="" style={{padding:8,borderRadius:6,border:'1px solid #ddd'}} onKeyDown={(e)=>{ if(e.key==='Enter'){ const v=emailRef.current?.value?.trim(); if(v) signInWithEmail(v); } }} />
+        <button style={{padding:'8px 12px',borderRadius:8,background:'#2563eb',color:'#fff',border:'none'}} onClick={()=>{ const v=emailRef.current?.value?.trim(); if(!v) return alert('Enter an email'); signInWithEmail(v); }}>Send Link</button>
       </div>
     );
   }
@@ -390,7 +384,7 @@ export default function Prepometer() {
     <div style={s.page}>
       <div style={s.header}>
         <div>
-          <div style={{fontSize:20,fontWeight:700}}>AFCAT Prepometer</div>
+          <div style={{fontSize:20,fontWeight:700}}>AFCAT Prepometer — Study Tracker</div>
         </div>
         <div style={{display:'flex',gap:8,alignItems:'center'}}>
           <button style={{padding:'8px 12px',borderRadius:8,background:'#0ea5a4',color:'#fff',border:'none'}} onClick={()=>alert('Keep going — consistency wins!')}>Motivate</button>
