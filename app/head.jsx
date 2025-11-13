@@ -1,3 +1,4 @@
+// app/head.jsx
 export default function Head() {
   return (
     <>
