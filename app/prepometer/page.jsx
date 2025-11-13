@@ -56,40 +56,56 @@ export default function Prepometer() {
 
   // session init + auth listener
   useEffect(() => {
-    let mounted = true;
-    (async () => {
-      try {
-        const { data } = await supabase.auth.getSession();
-        const session = data?.session ?? null;
-        if (!mounted) return;
-        setUser(session?.user ?? null);
-        setAuthLoading(false);
-        if (session?.user) {
-          await loadProfile(session.user.id);
-          await loadFromSupabase(session.user.id);
-        } else {
-          setProfile(null); setProfileLoading(false);
-        }
-      } catch (err) {
-        console.error('auth init', err);
-        setAuthLoading(false);
-        setProfileLoading(false);
-      }
-    })();
+  let mounted = true;
+  let authTimeout = null;
 
-    const { subscription } = supabase.auth.onAuthStateChange(async (_event, session) => {
+  async function init() {
+    try {
+      // quick check for session
+      const { data } = await supabase.auth.getSession();
+      const session = data?.session ?? null;
+      if (!mounted) return;
+
+      // make sure loading state doesn't hang forever
+      setAuthLoading(false);
       setUser(session?.user ?? null);
-      if (session?.user) {
-        await loadProfile(session.user.id);
-        await loadFromSupabase(session.user.id);
-      } else {
-        setProfile(null);
-        setProfileLoading(false);
-      }
-    });
 
-    return () => { mounted = false; subscription?.unsubscribe(); };
-  }, []);
+      if (session?.user) {
+        // ON LOGIN: load DB and merge with local
+        await loadFromSupabase(session.user.id, { mergeLocalIfEmpty: true });
+      } else {
+        // not logged in: keep local checklist (do NOT clear it)
+        // but also set a safety timeout to stop any UI spinner if something else blocked
+        authTimeout = setTimeout(() => {
+          if (mounted) setAuthLoading(false);
+        }, 6000);
+      }
+    } catch (err) {
+      console.error('auth init error', err);
+      if (mounted) setAuthLoading(false);
+    }
+  }
+
+  init();
+
+  const { subscription } = supabase.auth.onAuthStateChange(async (_event, session) => {
+    // always update user quickly
+    setUser(session?.user ?? null);
+    setAuthLoading(false);
+
+    // if user just logged in -> load DB and merge
+    if (session?.user) {
+      await loadFromSupabase(session.user.id, { mergeLocalIfEmpty: true });
+    }
+  });
+
+  return () => {
+    mounted = false;
+    if (authTimeout) clearTimeout(authTimeout);
+    subscription?.unsubscribe();
+  };
+}, []);
+
 
   // load profile
   async function loadProfile(userId) {
@@ -119,24 +135,90 @@ export default function Prepometer() {
   // charts data
   const chartData = dailyData.slice(-30).map(r => ({ date: r.date, hours: r.hours, mathsQ: r.mathsQ, reasoningQ: r.reasoningQ, mock: r.mock }));
 
-  // --- Supabase load user data (checklists + logs)
-  async function loadFromSupabase(userId) {
-    try {
-      // checklists
-      const { data: clData, error: clErr } = await supabase.from('checklists').select('id, subject, topic, status, notes').eq('user_id', userId).order('id', { ascending: true });
-      if (!clErr && clData) {
-        // map DB rows
-        setChecklist(clData.map(r => ({ id: r.id, subject: r.subject, topic: r.topic, status: r.status, notes: r.notes || '' })));
-      }
-      // daily logs
-      const { data: dlData, error: dlErr } = await supabase.from('daily_logs').select('id, log_date, hours, maths_q, reasoning_q, mock, notes').eq('user_id', userId).order('log_date', { ascending: true });
-      if (!dlErr && dlData) {
-        setDailyData(dlData.map(r => ({ id: r.id, date: r.log_date, hours: Number(r.hours) || 0, mathsQ: Number(r.maths_q) || 0, reasoningQ: Number(r.reasoning_q) || 0, mock: r.mock === null ? '' : Number(r.mock), notes: r.notes || '' })));
-      }
-    } catch (err) {
-      console.error('loadFromSupabase', err);
+  // loadFromSupabase with merge option
+async function loadFromSupabase(userId, opts = { mergeLocalIfEmpty: false }) {
+  try {
+    // fetch checklist rows for user
+    const { data: clData, error: clErr } = await supabase
+      .from('checklists')
+      .select('id, subject, topic, status, notes')
+      .eq('user_id', userId)
+      .order('id', { ascending: true });
+
+    if (clErr) {
+      console.error('Checklist fetch error', clErr);
     }
+
+    // fetch daily logs
+    const { data: dlData, error: dlErr } = await supabase
+      .from('daily_logs')
+      .select('id, log_date, hours, maths_q, reasoning_q, mock, notes')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: true });
+
+    if (dlErr) {
+      console.error('Daily logs fetch error', dlErr);
+    }
+
+    // --- Decide checklist state (merge logic) ---
+    if (Array.isArray(clData) && clData.length > 0) {
+      // DB has items — use DB checklist (map shape)
+      setChecklist(clData.map(r => ({ id: r.id, subject: r.subject, topic: r.topic, status: r.status, notes: r.notes })));
+    } else {
+      // DB empty or undefined
+      // Try to keep local checklist if present (avoid overwriting)
+      const local = (() => {
+        try { return JSON.parse(localStorage.getItem('prep_checklist')) || null; } catch { return null; }
+      })();
+
+      if (local && Array.isArray(local) && local.length > 0) {
+        // keep local UI checklist
+        setChecklist(local);
+        // Optionally import local to DB so user has a cloud copy
+        if (opts.mergeLocalIfEmpty && userId) {
+          // convert temp local items to insert payload
+          const toInsert = local.map(item => ({
+            user_id: userId,
+            subject: item.subject,
+            topic: item.topic,
+            status: item.status,
+            notes: item.notes || ''
+          }));
+          if (toInsert.length > 0) {
+            const { error: insertErr } = await supabase.from('checklists').insert(toInsert);
+            if (insertErr) console.error('Import local checklist to DB error', insertErr);
+            else console.info('Local checklist imported to cloud (because DB was empty).');
+          }
+        }
+      } else {
+        // No local data either -> fallback to DEFAULT_CHECKLIST
+        setChecklist(DEFAULT_CHECKLIST);
+      }
+    }
+
+    // --- daily logs ---
+    if (Array.isArray(dlData) && dlData.length > 0) {
+      setDailyData(dlData.map(r => ({
+        id: r.id,
+        date: r.log_date,
+        hours: Number(r.hours) || 0,
+        mathsQ: Number(r.maths_q) || 0,
+        reasoningQ: Number(r.reasoning_q) || 0,
+        mock: r.mock === null ? '' : Number(r.mock),
+        notes: r.notes || ''
+      })));
+    } else {
+      // keep local dailyData if exists (don't overwrite)
+      const localDl = (() => {
+        try { return JSON.parse(localStorage.getItem('prep_daily')) || []; } catch { return []; }
+      })();
+      if (localDl && localDl.length > 0) setDailyData(localDl);
+    }
+  } catch (err) {
+    console.error('loadFromSupabase error', err);
   }
+}
+
 
   // --- Sync helpers (save checklist item)
   async function saveChecklistItemToSupabase(item) {
